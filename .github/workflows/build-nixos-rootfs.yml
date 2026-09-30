@@ -1,0 +1,168 @@
+name: Build NixOS rootfs for Droidspaces
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Varian NixOS yang dibangun"
+        type: choice
+        options:
+          - both
+          - modern
+          - kernel-5.4-and-older
+        default: both
+      update_lock:
+        description: "Perbarui flake.lock ke versi terbaru (jika tidak, lock yang ada dipakai)"
+        type: boolean
+        default: false
+      publish:
+        description: "Publish the tarballs as a GitHub Release"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  lock:
+    name: Siapkan flake.lock
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Buat atau perbarui flake.lock
+        env:
+          UPDATE_LOCK: ${{ inputs.update_lock }}
+        run: |
+          if [ "$UPDATE_LOCK" = "true" ]; then
+            nix flake update
+          else
+            # Membuat lock jika belum ada; jika sudah ada, tidak mengubah apa pun
+            nix flake lock
+          fi
+
+      - name: Commit flake.lock
+        id: commit
+        run: |
+          # Hanya commit di branch. Pada push tag, HEAD dibiarkan apa adanya.
+          if [ "$GITHUB_REF_TYPE" = "branch" ] && [ -n "$(git status --porcelain flake.lock)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add flake.lock
+            git commit -m "chore: update flake.lock"
+            git push
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Pilih varian
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          all='[{"config":"droidnix","label":"modern"},{"config":"droidnix-old-kernel","label":"kernel-5.4-and-older"}]'
+          case "${VARIANT:-both}" in
+            modern)               sel="$(jq -c '[.[] | select(.label=="modern")]' <<<"$all")" ;;
+            kernel-5.4-and-older) sel="$(jq -c '[.[] | select(.label=="kernel-5.4-and-older")]' <<<"$all")" ;;
+            *)                    sel="$all" ;;
+          esac
+          echo "matrix={\"include\":$sel}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: [prepare, lock]
+    # Runner aarch64 native: gratis untuk repo publik.
+    # Repo privat butuh larger runner berbayar, atau ganti ke ubuntu-24.04 + QEMU.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.lock.outputs.sha }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build tarball
+        run: |
+          nix build \
+            ".#nixosConfigurations.${{ matrix.config }}.config.system.build.tarball" \
+            --print-build-logs \
+            --out-link result
+
+      - name: Collect tarball and checksum
+        run: |
+          mkdir -p dist
+          src="$(find -L result -type f \( -name '*.tar.xz' -o -name '*.tar.gz' -o -name '*.tar.zst' \) | head -n1)"
+          if [ -z "$src" ]; then
+            echo "Tarball tidak ditemukan di ./result:" >&2
+            find -L result >&2
+            exit 1
+          fi
+          ext="${src#*.tar}"
+          out="NixOS-${{ matrix.label }}-aarch64.tar${ext}"
+          cp -L "$src" "dist/$out"
+          (cd dist && sha256sum "$out" > "$out.sha256")
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nixos-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nixos-*
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="nixos-$(date -u +%Y%m%d-%H%M)"
+          fi
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "NixOS rootfs for Droidspaces ($tag)" \
+            --notes "Tarball NixOS aarch64 untuk Droidspaces. Pasang lewat Containers -> + -> pilih tarball. Gunakan varian kernel-5.4-and-older jika kernel perangkat 5.4 ke bawah."
