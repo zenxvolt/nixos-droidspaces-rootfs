@@ -17,13 +17,13 @@
       system = "aarch64-linux";
 
       # Konfigurasi bersama untuk kedua varian
-      common = { pkgs, ... }: {
+      common = { pkgs, lib, ... }: {
         imports = [
           droidspaces.nixosModules.working-droidspaces-rootfs-minimal
         ];
 
-        networking.hostName = "droidnix";
-        time.timeZone = "Asia/Jakarta";
+        networking.hostName = lib.mkDefault "droidnix";
+        time.timeZone = lib.mkDefault "Asia/Jakarta";
 
         # GANTI password ini setelah login pertama (passwd)
         users.users.user = {
@@ -41,7 +41,9 @@
 
         nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-        system.stateVersion = "25.11";
+        # mkDefault: modul Droidspaces sudah mengatur stateVersion sendiri ("26.05"),
+        # jadi nilai dari modul yang dipakai dan tidak terjadi konflik.
+        system.stateVersion = lib.mkDefault "25.11";
       };
 
       # Kompatibilitas untuk nixpkgs yang di-pin (varian kernel lama).
